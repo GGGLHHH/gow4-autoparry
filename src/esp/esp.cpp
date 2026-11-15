@@ -16,6 +16,8 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 
+#include "common/shared.h"
+
 #pragma comment(lib, "d3d11.lib")
 
 namespace {
@@ -35,27 +37,17 @@ constexpr uint32_t kTakenBit = 0x00200000;  // 物品对象 +0x278 的这一位�
 enum Kind : uint8_t {
     kChest, kRare, kLegend, kNornir, kSeal, kSilver, kArtifact, kRaven, kLore, kShrine, kMap, kRune, kBag, kBell, kSpinner, kKindCount
 };
+// 每一类的名字、颜色、ini 里的开关键名在 common/shared.h（修改器的菜单用同一张表），顺序和上面的 enum 一致
+static_assert(kKindCount == gow4::kEspKindCount, "enum Kind 和 common/shared.h 的类别表对不上");
 struct KindInfo {
     const char* label;
     ImU32 color;
 };
-const KindInfo kKinds[kKindCount] = {
-    {"宝箱", IM_COL32(232, 180, 74, 255)},
-    {"稀有宝箱", IM_COL32(143, 168, 255, 255)},
-    {"传说", IM_COL32(255, 138, 61, 255)},
-    {"诺恩宝箱", IM_COL32(179, 136, 255, 255)},
-    {"符文封印", IM_COL32(214, 190, 255, 255)},
-    {"银币", IM_COL32(201, 209, 217, 255)},
-    {"古物", IM_COL32(79, 209, 197, 255)},
-    {"奥丁的乌鸦", IM_COL32(46, 229, 157, 255)},
-    {"碑文", IM_COL32(224, 201, 166, 255)},
-    {"巨人神龛", IM_COL32(79, 195, 247, 255)},
-    {"藏宝图", IM_COL32(215, 163, 90, 255)},
-    {"符文", IM_COL32(240, 98, 146, 255)},
-    {"战利品", IM_COL32(165, 184, 74, 255)},
-    {"符文铃铛", IM_COL32(214, 190, 255, 255)},
-    {"符文转盘", IM_COL32(214, 190, 255, 255)},
-};
+KindInfo KindOf(int kind)
+{
+    const gow4::EspKind& k = gow4::kEspKinds[kind];
+    return {k.label, IM_COL32(k.r, k.g, k.b, 255)};
+}
 
 struct Item {
     uintptr_t go;
@@ -80,9 +72,11 @@ SRWLOCK g_listLock = SRWLOCK_INIT;
 ItemList g_shared{}; // 扫描线程写，渲染线程拷走
 
 struct Config {
+    bool on = true;            // ini 里 master 和 enabled 都是 1 才画
     float radius = 60.f;
     bool fovHorizontal = true; // 73.73° 是水平还是垂直视角，待校准
     float scale = 1.f;
+    bool show[kKindCount] = {true, true, true, true, true, true, true, true, true, true, true, true, true, true, true}; // show_<类别>
 };
 Config g_cfg; // 简单值，撕裂无害
 
@@ -394,11 +388,11 @@ void Scan(ItemList& L)
             logged[nLogged % 32][0] = L.items[i].go;
             logged[nLogged++ % 32][1] = L.items[i].dep;
             if (L.items[i].dep)
-                Log("%s %p 属于诺恩宝箱战利品 %p（%s，相距 %.0f m）：箱子开过就不再标", kKinds[L.items[i].kind].label,
+                Log("%s %p 属于诺恩宝箱战利品 %p（%s，相距 %.0f m）：箱子开过就不再标", gow4::kEspKinds[L.items[i].kind].label,
                     reinterpret_cast<void*>(L.items[i].go), reinterpret_cast<void*>(L.items[i].dep),
                     byTree ? "按层级：同一个区域组" : "层级对不上，按距离", std::sqrt(best));
             else
-                Log("%s %p 没找到所属的诺恩宝箱，照常标", kKinds[L.items[i].kind].label, reinterpret_cast<void*>(L.items[i].go));
+                Log("%s %p 没找到所属的诺恩宝箱，照常标", gow4::kEspKinds[L.items[i].kind].label, reinterpret_cast<void*>(L.items[i].go));
         }
     }
     int out = 0;
@@ -416,7 +410,7 @@ struct Tag {
 
 void DrawTag(ImDrawList* dl, const Tag& t, float s, float radius)
 {
-    const KindInfo& k = kKinds[t.kind];
+    const KindInfo k = KindOf(t.kind);
     const float near_ = 10.f;
     const float fade = t.dist <= near_ ? 1.f : 1.f - 0.5f * std::min(1.f, (t.dist - near_) / std::max(1.f, radius - near_));
     const auto A = [&](ImU32 c, float a) { return (c & 0x00FFFFFF) | (static_cast<ImU32>(((c >> 24) & 0xFF) * a * fade) << 24); };
@@ -459,12 +453,17 @@ void DrawItems(ImVec2 ds)
 
     if (g_selfTest) {
         const float s = ds.y / 1080.f * g_cfg.scale;
-        for (int k = 0; k < kKindCount; ++k)
+        int drawn = 0;
+        for (int k = 0; k < kKindCount; ++k) {
+            if (!g_cfg.show[k])
+                continue;
             DrawTag(ImGui::GetBackgroundDrawList(),
                 {ds.x * 0.5f + (k - kKindCount / 2) * 150.f * s, ds.y * 0.5f + (k % 2) * 60.f * s, 5.f + k * 9.f,
                     k == 2 ? 6.f : (k == 3 ? -6.f : 0.f), static_cast<Kind>(k)},
                 s, g_cfg.radius);
-        g_drawn.store(kKindCount, std::memory_order_relaxed);
+            ++drawn;
+        }
+        g_drawn.store(drawn, std::memory_order_relaxed);
         return;
     }
     const uintptr_t camMgr = ReadPtr(g_base + kCamMgrRva);
@@ -482,6 +481,8 @@ void DrawItems(ImVec2 ds)
     int n = 0;
     for (int i = 0; i < t_local.count; ++i) {
         const Item& it = t_local.items[i];
+        if (!cfg.show[it.kind])
+            continue; // 这一类在配置里关了
         uint32_t flags = 0;
         float w[3];
         if (!SafeRead(reinterpret_cast<void*>(it.go + 0x278), &flags, 4) || !(flags & kTakenBit) || !ReadWorld(it.go, w))
@@ -601,13 +602,17 @@ void Frame(IDXGISwapChain* sc)
     dev->Release();
     if (dev != g_device) // 别的设备的交换链（比如游戏重建了设备），不画
         return;
+    if (!g_cfg.on) { // 透视关着（总开关或它自己的开关）：这一帧什么都不做
+        g_drawn.store(0, std::memory_order_relaxed);
+        return;
+    }
 
     UINT w = 0, h = 0;
     ID3D11RenderTargetView* rtv = MakeRtv(sc, w, h);
     if (!rtv) {
         static bool once = false;
-        if (!once)
-            Log("创建渲染目标失败");
+        if (!once) // 设备状态不是 0 = 显卡设备已经丢了（驱动出错 / 被重置），是游戏那边的事，不是这里画坏的
+            Log("创建渲染目标失败（设备状态 %08lX）", static_cast<unsigned long>(g_device->GetDeviceRemovedReason()));
         once = true;
         return;
     }
@@ -736,6 +741,23 @@ void LoadConfig()
     g_cfg.fovHorizontal = buf[0] != L'v' && buf[0] != L'V';
     GetPrivateProfileStringW(L"esp", L"scale", L"1", buf, 32, g_iniPath);
     g_cfg.scale = std::clamp(static_cast<float>(_wtof(buf)), 0.5f, 3.f);
+
+    // 总开关（修改器的 F12，和弹反的一起切）和透视自己的开关：都是 1 才画
+    const bool on = GetPrivateProfileIntW(L"esp", L"master", 1, g_iniPath) != 0 &&
+        GetPrivateProfileIntW(L"esp", L"enabled", 1, g_iniPath) != 0;
+    int shown = 0;
+    bool changed = on != g_cfg.on;
+    for (int k = 0; k < kKindCount; ++k) {
+        wchar_t key[48] = L"show_";
+        wcscat_s(key, gow4::kEspKinds[k].key);
+        const bool show = GetPrivateProfileIntW(L"esp", key, 1, g_iniPath) != 0;
+        changed = changed || show != g_cfg.show[k];
+        g_cfg.show[k] = show;
+        shown += show;
+    }
+    g_cfg.on = on;
+    if (changed)
+        Log("配置：透视%s，标 %d / %d 类", on ? "开" : "关", shown, static_cast<int>(kKindCount));
 }
 
 DWORD WINAPI Worker(void*)
@@ -749,7 +771,8 @@ DWORD WINAPI Worker(void*)
     wcscpy_s(wcsrchr(g_iniPath, L'\\') + 1, MAX_PATH - (wcsrchr(g_iniPath, L'\\') + 1 - g_iniPath), L"gow4_esp.ini");
     LoadConfig();
 
-    HANDLE unload = CreateEventW(nullptr, TRUE, FALSE, L"Local\\gow4_esp_unload");
+    HANDLE unload = CreateEventW(nullptr, TRUE, FALSE, gow4::kEspUnloadEvent);
+    HANDLE reload = CreateEventW(nullptr, FALSE, FALSE, gow4::kEspReloadEvent); // 修改器写完 ini 后置位：马上重读，不等下面的 2 秒
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(g_base + reinterpret_cast<IMAGE_DOS_HEADER*>(g_base)->e_lfanew);
     bool installed = false;
@@ -775,7 +798,7 @@ DWORD WINAPI Worker(void*)
             ReleaseSRWLockExclusive(&g_listLock);
             lastScan = now;
         }
-        if (now - lastCfg >= 2000) {
+        if (now - lastCfg >= 2000 || (reload && WaitForSingleObject(reload, 0) == WAIT_OBJECT_0)) {
             LoadConfig();
             lastCfg = now;
         }
@@ -801,6 +824,8 @@ DWORD WINAPI Worker(void*)
     Log("==== 透视卸载 ====");
     if (g_log)
         fclose(g_log);
+    if (reload)
+        CloseHandle(reload);
     CloseHandle(unload);
     FreeLibraryAndExitThread(g_self, 0);
 }

@@ -22,6 +22,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "common/shared.h"
+
 namespace {
 
 HMODULE g_self = nullptr;
@@ -1838,9 +1840,10 @@ DWORD WINAPI Worker(void*)
     GetTempPathW(MAX_PATH, path);
     wcscat_s(path, L"gow4_autoparry.log");
     g_log = _wfsopen(path, L"ab", _SH_DENYNO);
-    Log("==== 自动弹反实验 v6.23（飞行物：命中标志高位 0004 不再当红光，盾接得住的照样提前按 L1 弹回去；盾真接不了的 / 背后来的飞行物提前侧闪；招式预读（v6.22）：敌人一出招就从招式数据读出每段攻击的命中标志，红光 / 盾接不住的提前闪，含冲击波；日志加「预读」「预读核对」行；其余同 v6.21：盾掩码规则、完整命中标志、敌人定义；v6.20：游戏自己的玩家指针、连按/定时单按 QTE 自动完成、按键图标记录、飞行物提前按 L1 + 兜底挡开、红光闪避）加载 ====");
+    Log("==== 自动弹反实验 v6.24（配合修改器界面：ini 加总开关 master，master=0 时弹反 / 闪避 / 预判 / 预读 / 飞行物 / QTE 自动完成全部按关处理、各自的值不变；修改器写完 ini 会置位重读事件，马上生效；战斗逻辑同 v6.23。v6.23：飞行物：命中标志高位 0004 不再当红光，盾接得住的照样提前按 L1 弹回去；盾真接不了的 / 背后来的飞行物提前侧闪；招式预读（v6.22）：敌人一出招就从招式数据读出每段攻击的命中标志，红光 / 盾接不住的提前闪，含冲击波；日志加「预读」「预读核对」行；其余同 v6.21：盾掩码规则、完整命中标志、敌人定义；v6.20：游戏自己的玩家指针、连按/定时单按 QTE 自动完成、按键图标记录、飞行物提前按 L1 + 兜底挡开、红光闪避）加载 ====");
     InitializeCriticalSection(&g_autoCs);
-    HANDLE unload = CreateEventW(nullptr, TRUE, FALSE, L"Local\\gow4_autoparry_unload");
+    HANDLE unload = CreateEventW(nullptr, TRUE, FALSE, gow4::kParryUnloadEvent);
+    HANDLE reload = CreateEventW(nullptr, FALSE, FALSE, gow4::kParryReloadEvent); // 修改器写完 ini 后置位：马上重读，不等每秒那次
     g_exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     const auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(g_exe + reinterpret_cast<IMAGE_DOS_HEADER*>(g_exe)->e_lfanew);
     bool ok = nt->OptionalHeader.SizeOfImage > 0x2000000;
@@ -2047,8 +2050,14 @@ DWORD WINAPI Worker(void*)
                 lastMag = v[3];
             }
         }
-        if (GetTickCount64() - lastIni > 1000) {
-            const bool on = GetPrivateProfileIntW(L"autoparry", L"parry", 1, ini) != 0;
+        if (GetTickCount64() - lastIni > 1000 || (reload && WaitForSingleObject(reload, 0) == WAIT_OBJECT_0)) {
+            // 总开关（修改器的 F12）：关着时下面所有「替你出手」的功能按关处理，ini 里各自的值不动，再开就回到原样
+            static bool lastMaster = true;
+            const bool master = GetPrivateProfileIntW(L"autoparry", L"master", 1, ini) != 0;
+            if (master != lastMaster)
+                Log("配置：总开关 %s", master ? "开" : "关（弹反 / 闪避 / 预判 / 预读 / 飞行物 / QTE 自动完成全部暂停）");
+            lastMaster = master;
+            const bool on = master && GetPrivateProfileIntW(L"autoparry", L"parry", 1, ini) != 0;
             if (g_parryOn.exchange(on) != on)
                 Log("配置：自动弹反 %s", on ? "开" : "关");
             if (GetPrivateProfileIntW(L"autoparry", L"test_evade", 0, ini) != 0) {
@@ -2114,12 +2123,12 @@ DWORD WINAPI Worker(void*)
             const bool z = GetPrivateProfileIntW(L"autoparry", L"zone", 0, ini) != 0;
             if (g_anyZone.exchange(z) != z)
                 Log("配置：弹反不限命中区域 %s", z ? "开" : "关");
-            const bool ev = GetPrivateProfileIntW(L"autoparry", L"evade", 1, ini) != 0;
+            const bool ev = master && GetPrivateProfileIntW(L"autoparry", L"evade", 1, ini) != 0;
             if (g_evadeOn.exchange(ev) != ev)
                 Log("配置：背后自动闪避 %s", ev ? "开" : "关");
             if (!g_seqRunning)
                 g_evadeTapUs.store(static_cast<int64_t>(GetPrivateProfileIntW(L"autoparry", L"evade_ms", 200, ini)) * 1000);
-            const bool pr = GetPrivateProfileIntW(L"autoparry", L"predict", 1, ini) != 0;
+            const bool pr = master && GetPrivateProfileIntW(L"autoparry", L"predict", 1, ini) != 0;
             if (g_predictOn.exchange(pr) != pr)
                 Log("配置：预判闪避 %s", pr ? "开" : "关");
             const int pms = static_cast<int>(GetPrivateProfileIntW(L"autoparry", L"predict_ms", 350, ini));
@@ -2131,17 +2140,17 @@ DWORD WINAPI Worker(void*)
             g_predictDistDm.store(static_cast<int>(GetPrivateProfileIntW(L"autoparry", L"predict_dist", 6, ini)) * 10);
             g_snapOn.store(GetPrivateProfileIntW(L"autoparry", L"snap", 0, ini) != 0);
             g_qteLog.store(GetPrivateProfileIntW(L"autoparry", L"qte_log", 1, ini) != 0);
-            const bool qm = GetPrivateProfileIntW(L"autoparry", L"qte_mash", 1, ini) != 0;
+            const bool qm = master && GetPrivateProfileIntW(L"autoparry", L"qte_mash", 1, ini) != 0;
             if (g_qteMash.exchange(qm) != qm)
                 Log("配置：连按 / 定时单按 QTE 自动完成 %s", qm ? "开" : "关");
             g_projDiag.store(GetPrivateProfileIntW(L"autoparry", L"proj_diag", 0, ini) != 0);
-            const bool pp = GetPrivateProfileIntW(L"autoparry", L"proj_pre", 1, ini) != 0;
+            const bool pp = master && GetPrivateProfileIntW(L"autoparry", L"proj_pre", 1, ini) != 0;
             if (g_projPre.exchange(pp) != pp)
                 Log("配置：飞行物预判弹反 %s", pp ? "开" : "关");
             const int plm = static_cast<int>(GetPrivateProfileIntW(L"autoparry", L"proj_lead_ms", 160, ini));
             if (g_projLeadMs.exchange(plm) != plm)
                 Log("配置：飞行物预判提前量 %d ms", plm);
-            const bool pev = GetPrivateProfileIntW(L"autoparry", L"proj_evade", 1, ini) != 0;
+            const bool pev = master && GetPrivateProfileIntW(L"autoparry", L"proj_evade", 1, ini) != 0;
             if (g_projEvade.exchange(pev) != pev)
                 Log("配置：盾接不了 / 背后来的飞行物提前侧闪 %s", pev ? "开" : "关");
             const int pem = static_cast<int>(GetPrivateProfileIntW(L"autoparry", L"proj_evade_ms", 300, ini));
@@ -2161,7 +2170,7 @@ DWORD WINAPI Worker(void*)
             const bool side = GetPrivateProfileIntW(L"autoparry", L"evade_side", 1, ini) != 0;
             if (g_evadeSide.exchange(side) != side)
                 Log("配置：巨魔类预判闪避方向 %s", side ? "侧闪" : "往后");
-            const bool pre = GetPrivateProfileIntW(L"autoparry", L"preread", 1, ini) != 0;
+            const bool pre = master && GetPrivateProfileIntW(L"autoparry", L"preread", 1, ini) != 0;
             if (g_preread.exchange(pre) != pre)
                 Log("配置：按招式数据预读攻击段、接不住的提前闪 %s", pre ? "开" : "关");
             const int bd = static_cast<int>(GetPrivateProfileIntW(L"autoparry", L"back_deg", 100, ini));
@@ -2410,6 +2419,8 @@ DWORD WINAPI Worker(void*)
     Log("==== 自动弹反实验卸载 ====");
     if (g_log)
         fclose(g_log);
+    if (reload)
+        CloseHandle(reload);
     CloseHandle(unload);
     FreeLibraryAndExitThread(g_self, 0);
 }
