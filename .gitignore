@@ -1,0 +1,27 @@
+# 构建产物（build\ 里还有热替换前手工留的备份 backup-*，同样不进版本库）
+build/
+build-dist/
+dist/
+out/
+x64/
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# 参考资料（第三方程序及其反编译结果、游戏本体的反编译片段）：只留在本机，不进版本库
+reference/
+
+# 分析脚本的运行环境和现场数据（日志片段、内存快照）
+tools/.venv/
+tools/snap/
+tools/.logtail_pos
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+*.user

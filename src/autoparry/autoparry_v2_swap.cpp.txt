@@ -1,0 +1,336 @@
+// 战神4 自动弹反（实验 v2）。
+// 原理（见 docs/gow4-findings.md「弹反 / 格挡」）：命中结算时，游戏拿受击者防御组里的防御体去匹配这次命中，
+// 匹配上半径 >0 的「弹反体」就是弹反。所以在命中结算 0x8c72a0 开始时，如果被打的是奎托斯，
+// 把他第一个防御组临时换成弹反体那一组，结算完立刻换回原样 —— 游戏走自己完整的弹反流程。
+// 弹反体组：防御组数组 16 格里残留的、半径 >0 的防御体（玩家点过一次 L1 就会被拷进来过）。实验用，之后改成从资源定位。
+// 另外 hook 格挡判定 0x79f0c0 只记录。日志 %TEMP%\gow4_autoparry.log；卸载：gow4_inject unload gow4_autoparry。
+#include <windows.h>
+#include <intrin.h>
+
+#include <atomic>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <initializer_list>
+#include <share.h>
+
+namespace {
+
+HMODULE g_self = nullptr;
+FILE* g_log = nullptr;
+uintptr_t g_exe = 0;
+std::atomic<int> g_inflight{0};
+
+void Log(const char* fmt, ...)
+{
+    if (!g_log)
+        return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    fprintf(g_log, "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    va_list a;
+    va_start(a, fmt);
+    vfprintf(g_log, fmt, a);
+    va_end(a);
+    fputc('\n', g_log);
+    fflush(g_log);
+}
+
+bool SafeRead(uintptr_t src, void* dst, size_t n)
+{
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(src), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+template <class T> T Rd(uintptr_t a)
+{
+    T v{};
+    SafeRead(a, &v, sizeof(T));
+    return v;
+}
+
+// ---- inline hook：前 8 字节原子替换为 E9 rel32 + NOP 填充，搬走的字节放跳板 ----
+struct Hook {
+    const char* name;
+    uintptr_t rva;
+    const uint8_t* expect;
+    size_t expectLen;
+    size_t stolen; // 5..8，必须是完整指令边界、无 rip 相对寻址
+    void* detour;
+    uint8_t* target = nullptr;
+    uint8_t* tramp = nullptr;
+    uint64_t original = 0;
+    bool installed = false;
+};
+
+uint8_t* AllocNear(uint8_t* near_)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const uintptr_t step = si.dwAllocationGranularity;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(near_) & ~(step - 1);
+    for (uintptr_t d = step; d < 0x7FF00000; d += step)
+        for (uintptr_t cand : {base - d, base + d})
+            if (void* p = VirtualAlloc(reinterpret_cast<void*>(cand), 4096, MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE))
+                return static_cast<uint8_t*>(p);
+    return nullptr;
+}
+
+void WriteAbsJmp(uint8_t* at, const void* to)
+{
+    at[0] = 0xFF;
+    at[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(at + 2) = 0;
+    *reinterpret_cast<const void**>(at + 6) = to;
+}
+
+bool SwapQword(uint8_t* target, uint64_t expect, uint64_t value)
+{
+    DWORD old;
+    if (!VirtualProtect(target, 8, PAGE_EXECUTE_READWRITE, &old))
+        return false;
+    const bool ok = static_cast<uint64_t>(_InterlockedCompareExchange64(reinterpret_cast<volatile long long*>(target),
+                        static_cast<long long>(value), static_cast<long long>(expect))) == expect;
+    VirtualProtect(target, 8, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), target, 8);
+    return ok;
+}
+
+bool Install(Hook& h)
+{
+    h.target = reinterpret_cast<uint8_t*>(g_exe + h.rva);
+    if ((reinterpret_cast<uintptr_t>(h.target) & 7) != 0 || memcmp(h.target, h.expect, h.expectLen) != 0) {
+        Log("[%s] 目标字节不匹配或没对齐，不装", h.name);
+        return false;
+    }
+    h.tramp = AllocNear(h.target);
+    if (!h.tramp) {
+        Log("[%s] 找不到跳板内存", h.name);
+        return false;
+    }
+    memcpy(h.tramp, h.target, h.stolen);
+    WriteAbsJmp(h.tramp + h.stolen, h.target + h.stolen);
+    uint8_t* relay = h.tramp + 0x40;
+    WriteAbsJmp(relay, h.detour);
+    FlushInstructionCache(GetCurrentProcess(), h.tramp, 0x60);
+    h.original = *reinterpret_cast<uint64_t*>(h.target);
+    uint8_t patch[8];
+    memcpy(patch, h.target, 8);
+    patch[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(patch + 1) = static_cast<int32_t>(relay - (h.target + 5));
+    for (size_t i = 5; i < h.stolen; ++i)
+        patch[i] = 0x90;
+    uint64_t value;
+    memcpy(&value, patch, 8);
+    if (!SwapQword(h.target, h.original, value)) {
+        Log("[%s] 原子写入失败", h.name);
+        return false;
+    }
+    h.installed = true;
+    Log("[%s] hook 已装：目标=%p 跳板=%p", h.name, h.target, h.tramp);
+    return true;
+}
+
+void Remove(Hook& h)
+{
+    if (!h.installed)
+        return;
+    const uint64_t cur = *reinterpret_cast<uint64_t*>(h.target);
+    Log("[%s] %s", h.name, SwapQword(h.target, cur, h.original) ? "已恢复原字节" : "恢复原字节失败！");
+}
+
+// ---- 游戏结构 ----
+// 命中记录 hit：+0x90 受击者生物。生物 +8 → 游戏对象（+0x38 名字），+0x3a70 → 防御组件。
+// 防御组件：+0x8 起防御组指针数组，+0x48 个数。防御组：+0x0 起 16 格防御体指针，+0x80 个数。防御体 +0x40 = 弹反范围（>0 即弹反体）。
+constexpr int kSetSlots = 16;
+constexpr int kMaxParry = 8;
+
+std::atomic<uintptr_t> g_hero{0};
+uintptr_t g_parry[kMaxParry];
+std::atomic<int> g_parryCount{0};
+std::atomic<uint32_t> g_swaps{0}, g_heroHits{0};
+
+bool IsHero(uintptr_t creature)
+{
+    if (!creature)
+        return false;
+    if (creature == g_hero.load(std::memory_order_relaxed))
+        return true;
+    char n[16] = {};
+    const uintptr_t go = Rd<uintptr_t>(creature + 8);
+    const uintptr_t str = go ? Rd<uintptr_t>(go + 0x38) : 0;
+    if (!str || !SafeRead(str, n, 10) || strncmp(n, "goheroa00", 10) != 0)
+        return false;
+    g_hero.store(creature, std::memory_order_relaxed);
+    return true;
+}
+
+// 从奎托斯的防御组里收集弹反体（半径 >0），包括数组里个数之外的残留格
+void CollectParry(uintptr_t hero)
+{
+    const uintptr_t D = Rd<uintptr_t>(hero + 0x3a70);
+    const int nSets = D ? Rd<int>(D + 0x48) : 0;
+    for (int s = 0; s < nSets && s < 4; ++s) {
+        const uintptr_t S = Rd<uintptr_t>(D + 8 + s * 8);
+        for (int i = 0; S && i < kSetSlots; ++i) {
+            const uintptr_t v = Rd<uintptr_t>(S + i * 8);
+            if (!v || !(Rd<float>(v + 0x40) > 0.f))
+                continue;
+            const int n = g_parryCount.load();
+            bool dup = false;
+            for (int k = 0; k < n; ++k)
+                dup |= g_parry[k] == v;
+            if (!dup && n < kMaxParry) {
+                g_parry[n] = v;
+                g_parryCount.store(n + 1);
+                Log("收集到弹反体 %p（半径 %.1f，掩码 %llX）", reinterpret_cast<void*>(v), Rd<float>(v + 0x40),
+                    static_cast<unsigned long long>(Rd<uint64_t>(v + 0x10)));
+            }
+        }
+    }
+}
+
+// ---- 命中结算 0x8c72a0(hit, result) ----
+using ResolveFn = void(__fastcall*)(uintptr_t hit, float* result);
+// mov [rsp+10h],rdx / push rbp / push rbx
+constexpr uint8_t kResolveBytes[8] = {0x48, 0x89, 0x54, 0x24, 0x10, 0x55, 0x53, 0x56};
+void __fastcall ResolveDetour(uintptr_t hit, float* result);
+Hook g_resolve{"命中结算", 0x8c72a0, kResolveBytes, sizeof(kResolveBytes), 6, reinterpret_cast<void*>(&ResolveDetour)};
+
+void __fastcall ResolveDetour(uintptr_t hit, float* result)
+{
+    g_inflight.fetch_add(1, std::memory_order_acquire);
+    const auto orig = reinterpret_cast<ResolveFn>(g_resolve.tramp);
+    const uintptr_t victim = Rd<uintptr_t>(hit + 0x90);
+    uintptr_t S = 0, saved[kSetSlots];
+    int savedCount = 0;
+    if (IsHero(victim)) {
+        g_heroHits.fetch_add(1);
+        const int np = g_parryCount.load();
+        const uintptr_t D = Rd<uintptr_t>(victim + 0x3a70);
+        if (np > 0 && D && Rd<int>(D + 0x48) >= 1) {
+            S = Rd<uintptr_t>(D + 8);
+            if (S && SafeRead(S, saved, sizeof(saved)) && SafeRead(S + 0x80, &savedCount, 4)) {
+                __try {
+                    for (int i = 0; i < np; ++i)
+                        reinterpret_cast<uintptr_t*>(S)[i] = g_parry[i];
+                    *reinterpret_cast<int*>(S + 0x80) = np;
+                    g_swaps.fetch_add(1);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    S = 0;
+                }
+            } else {
+                S = 0;
+            }
+        }
+    }
+    orig(hit, result);
+    if (S) { // 换回原样
+        __try {
+            memcpy(reinterpret_cast<void*>(S), saved, sizeof(saved));
+            *reinterpret_cast<int*>(S + 0x80) = savedCount;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    g_inflight.fetch_sub(1, std::memory_order_release);
+}
+
+// ---- 格挡判定 0x79f0c0：只记录 ----
+using BlockFn = uint64_t(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uint64_t, uint64_t, uint64_t, uint8_t*);
+constexpr uint8_t kBlockBytes[8] = {0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x10, 0x49};
+uint64_t __fastcall BlockDetour(uintptr_t, uintptr_t, uintptr_t, uint64_t, uint64_t, uint64_t, uint8_t*);
+Hook g_block{"格挡判定", 0x79f0c0, kBlockBytes, sizeof(kBlockBytes), 7, reinterpret_cast<void*>(&BlockDetour)};
+
+struct Rec {
+    uint64_t tick;
+    uintptr_t attacker, victim, vol;
+    uint8_t ret, out;
+};
+constexpr uint32_t kRing = 1 << 10;
+Rec g_ring[kRing];
+std::atomic<uint32_t> g_head{0};
+
+uint64_t __fastcall BlockDetour(uintptr_t d, uintptr_t attacker, uintptr_t victim, uint64_t f, uint64_t p5, uint64_t p6,
+    uint8_t* out)
+{
+    g_inflight.fetch_add(1, std::memory_order_acquire);
+    const uint64_t r = reinterpret_cast<BlockFn>(g_block.tramp)(d, attacker, victim, f, p5, p6, out);
+    IsHero(attacker); // 奎托斯打敌人时也认一下，好在他第一次挨打前就收集到弹反体
+    if (IsHero(victim)) {
+        Rec& e = g_ring[g_head.fetch_add(1) & (kRing - 1)];
+        e.tick = GetTickCount64();
+        e.attacker = attacker;
+        e.victim = victim;
+        e.vol = 0;
+        e.ret = static_cast<uint8_t>(r);
+        e.out = out ? *out : 0xFF;
+    }
+    g_inflight.fetch_sub(1, std::memory_order_release);
+    return r;
+}
+
+DWORD WINAPI Worker(void*)
+{
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"gow4_autoparry.log");
+    g_log = _wfsopen(path, L"ab", _SH_DENYNO);
+    Log("==== 自动弹反实验 v2（命中时换成弹反体）加载 ====");
+    HANDLE unload = CreateEventW(nullptr, TRUE, FALSE, L"Local\\gow4_autoparry_unload");
+    g_exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(g_exe + reinterpret_cast<IMAGE_DOS_HEADER*>(g_exe)->e_lfanew);
+    bool ok = nt->OptionalHeader.SizeOfImage > 0x2000000;
+    if (!ok)
+        Log("宿主进程不是 GoW.exe，不装");
+    ok = ok && Install(g_block) && Install(g_resolve);
+
+    uint32_t tail = 0;
+    uint64_t lastCollect = 0;
+    while (ok && WaitForSingleObject(unload, 50) != WAIT_OBJECT_0) {
+        const uint64_t now = GetTickCount64();
+        if (now - lastCollect > 1000) { // 弹反体收集：玩家每次点 L1，弹反组都会被拷进防御组
+            if (const uintptr_t h = g_hero.load())
+                CollectParry(h);
+            lastCollect = now;
+        }
+        const uint32_t head = g_head.load();
+        for (; tail != head; ++tail) {
+            const Rec& e = g_ring[tail & (kRing - 1)];
+            const uintptr_t vol = Rd<uintptr_t>(e.victim + 0x4670);
+            Log("奎托斯被打：格挡判定 返回=%u 输出=%u 匹配防御体=%p（半径 %.1f）  累计换弹反体 %u 次 / 被打 %u 次",
+                e.ret, e.out, reinterpret_cast<void*>(vol), vol ? Rd<float>(vol + 0x40) : -1.f, g_swaps.load(),
+                g_heroHits.load());
+        }
+    }
+    if (ok || g_block.installed || g_resolve.installed) {
+        Remove(g_resolve);
+        Remove(g_block);
+        for (int i = 0; i < 200 && g_inflight.load() != 0; ++i)
+            Sleep(10);
+        Sleep(200);
+    }
+    Log("==== 自动弹反实验卸载 ====");
+    if (g_log)
+        fclose(g_log);
+    CloseHandle(unload);
+    FreeLibraryAndExitThread(g_self, 0);
+}
+
+} // namespace
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_self = module;
+        DisableThreadLibraryCalls(module);
+        if (HANDLE t = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr))
+            CloseHandle(t);
+    }
+    return TRUE;
+}

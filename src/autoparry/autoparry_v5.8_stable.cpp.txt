@@ -1,0 +1,992 @@
+// 战神4 自动弹反（实验 v3：吞掉第一下 + 替玩家按 L1）。
+// v2（命中结算时换弹反体，源码留在 autoparry_v2_swap.cpp.txt）证明：结算结果和自然弹反一模一样也不出弹反动作，
+// 弹反动作要奎托斯的动作状态机正处在「刚按 L1」的弹反窗口里才会接。所以 v3：
+//   1. hook 碰撞→命中入口 0x8c9e30：敌人这一刀第一次碰到奎托斯、而他不在弹反窗口时，先不让它进结算（原函数本来就有
+//      直接 return 的分支），同时开始「按住 L1」；
+//   2. hook 按键条件判定 0x87ac70：按住期间，动作ID 0x05（L1）的类型 1/7 条件一律返回成立 —— 等于游戏内部按下 L1；
+//   3. 奎托斯的防御组里出现半径 >0 的弹反体（= 进了弹反窗口）后，这一刀再碰到就放行 → 走游戏自己的弹反流程。
+//   吞的时间有上限，超时就放行，不会变成无敌。
+// 另外 hook 格挡判定 0x79f0c0 只记录结果。日志 %TEMP%\gow4_autoparry.log；卸载：gow4_inject unload gow4_autoparry。
+// 注意：0x87ac70 和 QTE 探针 gow4_probe.dll 是同一个函数，要先卸探针。
+#include <windows.h>
+#include <intrin.h>
+
+#include <atomic>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cmath>
+#include <cstring>
+#include <initializer_list>
+#include <share.h>
+#include <unordered_set>
+
+namespace {
+
+HMODULE g_self = nullptr;
+FILE* g_log = nullptr;
+uintptr_t g_exe = 0;
+std::atomic<int> g_inflight{0};
+
+void Log(const char* fmt, ...)
+{
+    if (!g_log)
+        return;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    fprintf(g_log, "%02d:%02d:%02d.%03d ", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds);
+    va_list a;
+    va_start(a, fmt);
+    vfprintf(g_log, fmt, a);
+    va_end(a);
+    fputc('\n', g_log);
+    fflush(g_log);
+}
+
+bool SafeRead(uintptr_t src, void* dst, size_t n)
+{
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(src), n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+template <class T> T Rd(uintptr_t a)
+{
+    T v{};
+    SafeRead(a, &v, sizeof(T));
+    return v;
+}
+
+// ---- inline hook：前 8 字节原子替换为 E9 rel32 + NOP 填充，搬走的字节放跳板 ----
+struct Hook {
+    const char* name;
+    uintptr_t rva;
+    const uint8_t* expect;
+    size_t expectLen;
+    size_t stolen; // 5..8，必须是完整指令边界、无 rip 相对寻址
+    void* detour;
+    uint8_t* target = nullptr;
+    uint8_t* tramp = nullptr;
+    uint64_t original = 0;
+    bool installed = false;
+};
+
+uint8_t* AllocNear(uint8_t* near_)
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const uintptr_t step = si.dwAllocationGranularity;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(near_) & ~(step - 1);
+    for (uintptr_t d = step; d < 0x7FF00000; d += step)
+        for (uintptr_t cand : {base - d, base + d})
+            if (void* p = VirtualAlloc(reinterpret_cast<void*>(cand), 4096, MEM_COMMIT | MEM_RESERVE,
+                    PAGE_EXECUTE_READWRITE))
+                return static_cast<uint8_t*>(p);
+    return nullptr;
+}
+
+void WriteAbsJmp(uint8_t* at, const void* to)
+{
+    at[0] = 0xFF;
+    at[1] = 0x25;
+    *reinterpret_cast<uint32_t*>(at + 2) = 0;
+    *reinterpret_cast<const void**>(at + 6) = to;
+}
+
+bool SwapQword(uint8_t* target, uint64_t expect, uint64_t value)
+{
+    DWORD old;
+    if (!VirtualProtect(target, 8, PAGE_EXECUTE_READWRITE, &old))
+        return false;
+    const bool ok = static_cast<uint64_t>(_InterlockedCompareExchange64(reinterpret_cast<volatile long long*>(target),
+                        static_cast<long long>(value), static_cast<long long>(expect))) == expect;
+    VirtualProtect(target, 8, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), target, 8);
+    return ok;
+}
+
+bool Install(Hook& h)
+{
+    h.target = reinterpret_cast<uint8_t*>(g_exe + h.rva);
+    if ((reinterpret_cast<uintptr_t>(h.target) & 7) != 0 || memcmp(h.target, h.expect, h.expectLen) != 0) {
+        Log("[%s] 目标字节不匹配或没对齐，不装", h.name);
+        return false;
+    }
+    h.tramp = AllocNear(h.target);
+    if (!h.tramp) {
+        Log("[%s] 找不到跳板内存", h.name);
+        return false;
+    }
+    memcpy(h.tramp, h.target, h.stolen);
+    WriteAbsJmp(h.tramp + h.stolen, h.target + h.stolen);
+    uint8_t* relay = h.tramp + 0x40;
+    WriteAbsJmp(relay, h.detour);
+    FlushInstructionCache(GetCurrentProcess(), h.tramp, 0x60);
+    h.original = *reinterpret_cast<uint64_t*>(h.target);
+    uint8_t patch[8];
+    memcpy(patch, h.target, 8);
+    patch[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(patch + 1) = static_cast<int32_t>(relay - (h.target + 5));
+    for (size_t i = 5; i < h.stolen; ++i)
+        patch[i] = 0x90;
+    uint64_t value;
+    memcpy(&value, patch, 8);
+    if (!SwapQword(h.target, h.original, value)) {
+        Log("[%s] 原子写入失败", h.name);
+        return false;
+    }
+    h.installed = true;
+    Log("[%s] hook 已装：目标=%p 跳板=%p", h.name, h.target, h.tramp);
+    return true;
+}
+
+void Remove(Hook& h)
+{
+    if (!h.installed)
+        return;
+    const uint64_t cur = *reinterpret_cast<uint64_t*>(h.target);
+    Log("[%s] %s", h.name, SwapQword(h.target, cur, h.original) ? "已恢复原字节" : "恢复原字节失败！");
+}
+
+// ---- 游戏结构 ----
+// 生物 +8 → 游戏对象（+0x38 名字），+0x3a70 → 防御组件。
+// 防御组件：+0x8 起防御组指针数组，+0x48 个数。防御组：+0x0 起 16 格防御体指针，+0x80 个数。防御体 +0x40 = 弹反范围（>0 即弹反体）。
+// 碰撞→命中入口 0x8c9e30(a, b, c, d, e)：a+0x20 攻击者生物，b+0x20 受击者生物（见 docs/gow4-findings.md）。
+constexpr int kSetSlots = 16;
+
+// 时间参数（微秒）
+constexpr int64_t kSwallowUs = 300'000; // 一刀最多吞这么久，超时放行
+constexpr int64_t kHoldUs = 450'000;    // 按住 L1 多久
+constexpr int64_t kRearmUs = kHoldUs + 30'000; // 上一次按住结束就能再按（留一帧松开）
+constexpr int64_t kReleaseUs = 34'000; // 玩家自己按着 L1 时，先替他松开约两帧再按下，才有新的弹反窗口
+std::atomic<int64_t> g_evadeTapUs{200'000};  // 闪避：× 按多久（实测你手按 150~200 ms；ini evade_ms）
+// 闪避按「同一刀」吞：同一个攻击者的碰撞间隔 < 150 ms 算同一刀（巨魔下砸的冲击波能连着碰 1 秒多、追到 5 m 外），
+// 闪过的那一刀整段吞掉，最长 2 s；隔开 150 ms 以上才算新的一刀
+constexpr int64_t kEvadeGapUs = 150'000;
+constexpr int64_t kEvadeMaxUs = 2'000'000;
+constexpr int64_t kEvadeRearmUs = 400'000;
+std::atomic<uintptr_t> g_evAttacker{0};
+std::atomic<int64_t> g_evLast{0};
+
+int64_t NowUs()
+{
+    static const int64_t freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart;
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart / freq * 1'000'000 + c.QuadPart % freq * 1'000'000 / freq;
+}
+
+std::atomic<uintptr_t> g_hero{0};
+std::atomic<int64_t> g_pressStart{0};
+std::atomic<bool> g_l1Natural{false};   // 不强制时，游戏判定的 L1 按住（类型 7）结果 = 玩家自己是否按着
+std::atomic<bool> g_releaseFirst{false};
+std::atomic<uintptr_t> g_passAttacker{0}; // 弹反窗口里放行的那一刀的攻击者，用来认「震开」
+std::atomic<int64_t> g_passUs{0};
+std::atomic<uint32_t> g_parryOk{0}, g_parryTry{0};
+std::atomic<uint32_t> g_forced{0}, g_condSeen{0};
+std::atomic<bool> g_anyAngle{false}; // 实验过：清掉弹反体 +0x08 条件表也挡不住背后挨打，默认关
+std::atomic<bool> g_parryOn{true};   // gow4_autoparry.ini [autoparry] parry=0/1，每秒重读
+std::atomic<bool> g_anyZone{false};  // zone=0/1：弹反窗口里不限命中区域
+std::atomic<bool> g_evadeOn{true};   // evade=0/1：背后来的刀改成自动闪避
+std::atomic<int> g_backDeg{100};     // back_deg：方位角绝对值超过它算背后（0° 正前方，180° 正后方）
+std::atomic<int64_t> g_evadeStart{0};
+std::atomic<uint32_t> g_evadeForced{0};
+std::atomic<float> g_evadeDirX{0.f}, g_evadeDirZ{0.f}; // 往哪闪（世界 x/z 单位向量）
+
+// 游戏对象世界坐标：本地平移 GO+0x90；父类型 GO+0x148 为 2/3/4 时乘父矩阵缓存 GO+0xf0
+bool WorldPos(uintptr_t go, float out[3])
+{
+    float L[16], P[16];
+    if (!go || !SafeRead(go + 0x60, L, sizeof(L)) || !SafeRead(go + 0xf0, P, sizeof(P)))
+        return false;
+    const int kind = Rd<int>(go + 0x148);
+    const bool parent = (kind == 2 || kind == 3 || kind == 4) && (P[0] != 0.f || P[5] != 0.f || P[10] != 0.f);
+    for (int c = 0; c < 3; ++c)
+        out[c] = parent ? L[12] * P[c] + L[13] * P[4 + c] + L[14] * P[8 + c] + P[12 + c] : L[12 + c];
+    return true;
+}
+
+// 攻击者相对奎托斯的水平方位角（度，-180..180）。和游戏 0x723b60 一致：正前方 = 奎托斯矩阵 row2 的反方向；
+// 攻击者在 row0 一侧时为负（游戏角度 = deg<0 ? 360+deg : deg）
+bool Bearing(uintptr_t hero, uintptr_t attacker, float& deg, float& dist)
+{
+    const uintptr_t hg = Rd<uintptr_t>(hero + 8), ag = Rd<uintptr_t>(attacker + 8);
+    float hp[3], ap[3], L[12];
+    if (!WorldPos(hg, hp) || !WorldPos(ag, ap) || !SafeRead(hg + 0x60, L, sizeof(L)))
+        return false;
+    const float dx = ap[0] - hp[0], dz = ap[2] - hp[2];
+    const float f = -(dx * L[8] + dz * L[10]), r = dx * L[0] + dz * L[2];
+    deg = atan2f(-r, f) * 57.29578f;
+    dist = sqrtf(dx * dx + dz * dz);
+    return true;
+}
+
+bool IsHero(uintptr_t creature)
+{
+    if (!creature)
+        return false;
+    if (creature == g_hero.load(std::memory_order_relaxed))
+        return true;
+    char n[16] = {};
+    const uintptr_t go = Rd<uintptr_t>(creature + 8);
+    const uintptr_t str = go ? Rd<uintptr_t>(go + 0x38) : 0;
+    if (!str || !SafeRead(str, n, 10) || strncmp(n, "goheroa00", 10) != 0)
+        return false;
+    g_hero.store(creature, std::memory_order_relaxed);
+    return true;
+}
+
+// 奎托斯当前防御组里有没有弹反体（半径 >0）= 是否在弹反窗口
+bool InParryWindow(uintptr_t hero)
+{
+    const uintptr_t D = Rd<uintptr_t>(hero + 0x3a70);
+    const int nSets = D ? Rd<int>(D + 0x48) : 0;
+    for (int s = 0; s < nSets && s < 4; ++s) {
+        const uintptr_t S = Rd<uintptr_t>(D + 8 + s * 8);
+        const int n = S ? Rd<int>(S + 0x80) : 0;
+        for (int i = 0; i < n && i < kSetSlots; ++i) {
+            const uintptr_t v = Rd<uintptr_t>(S + i * 8);
+            if (v && Rd<float>(v + 0x40) > 0.f)
+                return true;
+        }
+    }
+    return false;
+}
+
+// 攻击者是不是落在奎托斯的「可弹反区域」：读游戏自己的受击区域表（防御组件 +0x10e0，0x724fe0 同款查法），
+// 区域哈希 = 弹反体 +0x20 认的 011CBBEB9CE82EB8 就能弹反。实测表：该区域 270°..90°（正前方左右各 90°）。读不到就按 ±90°。
+constexpr uint64_t kParryZone = 0x011CBBEB9CE82EB8ull;
+bool InParryZone(uintptr_t hero, float deg)
+{
+    const float a = deg < 0.f ? deg + 360.f : deg;
+    const uintptr_t D = Rd<uintptr_t>(hero + 0x3a70);
+    if (D) {
+        uint64_t key = 0;
+        const int nSets = Rd<int>(D + 0x48);
+        for (int i = 0; i < nSets && i < 4 && !key; ++i)
+            key = Rd<uint64_t>(Rd<uintptr_t>(D + 8 + i * 8) + 0xf8);
+        if (!key)
+            key = Rd<uint64_t>(Rd<uintptr_t>(D + 0x10d0) + 0x18);
+        const uintptr_t M = Rd<uintptr_t>(D + 0x10e0);
+        const int n = M ? Rd<int>(M + 0x28) : 0;
+        const uintptr_t arr = M ? Rd<uintptr_t>(M + 0x20) : 0;
+        for (int i = 0; arr && i < n && i < 64; ++i) {
+            if (Rd<uint64_t>(arr + i * 16 + 8) != key)
+                continue;
+            const uintptr_t list = Rd<uintptr_t>(arr + i * 16);
+            for (int k = 1; list && k <= 8; ++k) {
+                const uintptr_t z = Rd<uintptr_t>(list + k * 8);
+                if (!z)
+                    continue;
+                const float lo = Rd<float>(z + 8), hi = Rd<float>(z + 0xc);
+                const bool in = lo <= hi ? (a >= lo && a <= hi) : (a >= lo || a <= hi);
+                if (in)
+                    return Rd<uint64_t>(z) == kParryZone;
+            }
+            break;
+        }
+    }
+    return fabsf(deg) <= 90.f;
+}
+
+// ---- 事件环（钩子里只写环，后台线程写日志）----
+enum Kind : uint8_t { kPress, kSwallow, kPassWindow, kPassTimeout, kPassRearm, kBlock, kOff, kEvPress, kEvSwallow, kEvPass, kShove, kBackSkip, kHeld };
+struct Rec {
+    int64_t us;
+    int64_t sincePress;
+    uintptr_t attacker, victim;
+    Kind kind;
+    uint8_t ret, out, cleared;
+    float deg, dist;
+    uint64_t flags, p5, p6;
+    uint16_t aiState;  // 攻击者 AI(生物+0x3a58) +0x1438：被格挡时只有 0x10/0x20/0x400 才会做「被弹开」反应（0x1406b8e50）
+    uint8_t react;     // 攻击者 AI 配置(+0x20) 的默认被格挡反应(+0x290) 的类型(+0x28)：0 无反应，1 硬直，2 击退，3/4 其他
+    uint8_t matchReact; // 奎托斯这次匹配的防御体(+0x4670) 自带的反应类型(+0x28)，0 = 交给攻击者默认
+};
+constexpr uint32_t kRing = 1 << 10;
+Rec g_ring[kRing];
+std::atomic<uint32_t> g_head{0};
+
+void Push(Kind k, uintptr_t attacker, uintptr_t victim, uint8_t ret = 0, uint8_t out = 0, uint8_t cleared = 0,
+    uint64_t flags = 0, uint64_t p5 = 0, uint64_t p6 = 0)
+{
+    Rec& e = g_ring[g_head.fetch_add(1) & (kRing - 1)];
+    e.flags = flags;
+    e.p5 = p5;
+    e.p6 = p6;
+    e.deg = e.dist = -1.f;
+    if (attacker && !Bearing(victim, attacker, e.deg, e.dist))
+        e.deg = e.dist = -1.f;
+    e.us = NowUs();
+    const int64_t ps = g_pressStart.load();
+    e.sincePress = ps ? e.us - ps : -1;
+    e.attacker = attacker;
+    e.victim = victim;
+    e.kind = k;
+    e.ret = ret;
+    e.out = out;
+    e.cleared = cleared;
+    e.aiState = 0xFFFF;
+    e.react = e.matchReact = 0xFF;
+    if (k == kBlock && attacker) {
+        const uintptr_t ai = Rd<uintptr_t>(attacker + 0x3a58);
+        if (ai) {
+            e.aiState = Rd<uint16_t>(ai + 0x1438);
+            const uintptr_t cfg = Rd<uintptr_t>(ai + 0x20);
+            const uintptr_t d = cfg ? Rd<uintptr_t>(cfg + 0x290) : 0;
+            e.react = d ? Rd<uint8_t>(d + 0x28) : 0xFE;
+        }
+        const uintptr_t vol = Rd<uintptr_t>(victim + 0x4670);
+        e.matchReact = vol ? Rd<uint8_t>(vol + 0x28) : 0xFE;
+    }
+}
+
+// 实测（2026-11-14）：巨魔 gotroll00 的近战，格挡判定在弹反窗口里也通过，但奎托斯不进弹反成功状态（0/9），改走闪避
+bool IsHeavyAttacker(uintptr_t creature)
+{
+    char n[16] = {};
+    const uintptr_t go = Rd<uintptr_t>(creature + 8);
+    const uintptr_t str = go ? Rd<uintptr_t>(go + 0x38) : 0;
+    return str && SafeRead(str, n, 8) && strncmp(n, "gotroll", 7) == 0;
+}
+
+// ---- 1. 碰撞→命中入口 0x8c9e30 ----
+using ContactFn = void(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+// push rbp / push rsi / push r13 / push r15（共 7 字节）/ lea rbp,[rsp-0x288]
+constexpr uint8_t kContactBytes[8] = {0x40, 0x55, 0x56, 0x41, 0x55, 0x41, 0x57, 0x48};
+void __fastcall ContactDetour(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+Hook g_contact{"碰撞命中", 0x8c9e30, kContactBytes, sizeof(kContactBytes), 7, reinterpret_cast<void*>(&ContactDetour)};
+
+// 0x8c9e30 有个游戏自己的未初始化读：0x8ca2e3 读 [rbp+0x78]（第一次写在 0x8ca3e9），为 0 时才去算 p6 哈希
+// （命中记录 +0xd0，格挡/弹反体按它匹配）。平时那块栈恰好是 0；我们的钩子在它下面算过东西会留下残值，
+// p6 就变成垃圾，正面也弹反不了。所以调原函数前把下面这块栈清零，恢复成游戏自然调用时的样子。
+__declspec(noinline) void ScrubStack()
+{
+    volatile uint8_t buf[0x1000];
+    for (size_t i = 0; i < sizeof(buf); ++i)
+        buf[i] = 0;
+}
+
+void __fastcall ContactDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d, uintptr_t e)
+{
+    g_inflight.fetch_add(1, std::memory_order_acquire);
+    const uintptr_t victim = Rd<uintptr_t>(b + 0x20);
+    bool swallow = false;
+    if (IsHero(victim)) {
+        const uintptr_t attacker = Rd<uintptr_t>(a + 0x20);
+        const int64_t now = NowUs();
+        const int64_t ps = g_pressStart.load();
+        float deg = 0.f, dist = 0.f;
+        const bool heavy = IsHeavyAttacker(attacker); // 巨魔这类：格挡判定能过但游戏不出弹反（命中标志高位 0004），改闪避
+        const bool back = (Bearing(victim, attacker, deg, dist) && !InParryZone(victim, deg)) || heavy;
+        const int64_t es = g_evadeStart.load();
+        if (back && g_evadeOn.load(std::memory_order_relaxed)) {
+            const bool sameSwing = attacker == g_evAttacker.load() && now - g_evLast.load() < kEvadeGapUs && es &&
+                                   now - es < kEvadeMaxUs;
+            if (sameSwing) {
+                g_evLast.store(now);
+                swallow = true;
+                Push(kEvSwallow, attacker, victim);
+            } else if (es == 0 || now - es > kEvadeRearmUs) {
+                g_evAttacker.store(attacker);
+                g_evLast.store(now);
+                float hp[3], ap[3];
+                if (WorldPos(Rd<uintptr_t>(victim + 8), hp) && WorldPos(Rd<uintptr_t>(attacker + 8), ap)) {
+                    const float dx = hp[0] - ap[0], dz = hp[2] - ap[2], l = sqrtf(dx * dx + dz * dz);
+                    g_evadeDirX.store(l > 0.f ? dx / l : 0.f);
+                    g_evadeDirZ.store(l > 0.f ? dz / l : 0.f);
+                }
+                g_evadeStart.store(now);
+                swallow = true;
+                Push(kEvPress, attacker, victim);
+            } else {
+                Push(kEvPass, attacker, victim);
+            }
+        } else if (back) {
+            Push(kBackSkip, attacker, victim);
+        } else if (!g_parryOn.load(std::memory_order_relaxed)) {
+            Push(kOff, attacker, victim);
+        } else if (g_l1Natural.load(std::memory_order_relaxed) && !(ps && now - ps < kHoldUs)) {
+            Push(kHeld, attacker, victim); // 实测：按着盾时替他松开再按，碰撞只持续几十毫秒，来不及进弹反窗口，反而吞掉了格挡
+        } else if (InParryWindow(victim)) {
+            if (g_passAttacker.exchange(attacker) != attacker || now - g_passUs.load() > 300'000)
+                g_parryTry.fetch_add(1);
+            g_passUs.store(now);
+            Push(kPassWindow, attacker, victim);
+        } else if (ps == 0 || now - ps > kRearmUs) {
+            g_releaseFirst.store(false);
+            g_pressStart.store(now);
+            swallow = true;
+            Push(kPress, attacker, victim);
+        } else if (now - ps < kSwallowUs) {
+            swallow = true;
+            Push(kSwallow, attacker, victim);
+        } else {
+            Push(now - ps < kRearmUs ? kPassTimeout : kPassRearm, attacker, victim);
+        }
+    }
+    if (!swallow) {
+        ScrubStack();
+        reinterpret_cast<ContactFn>(g_contact.tramp)(a, b, c, d, e);
+    }
+    g_inflight.fetch_sub(1, std::memory_order_release);
+}
+
+// ---- 防御组变化记录（在游戏线程每次条件判定时采样，变了才记）----
+struct DefRec {
+    int64_t us;
+    uint8_t what; // 0 防御组变化，1 × 按下，2 × 松开
+    int n;
+    uintptr_t vols[8];
+};
+constexpr uint32_t kDefRing = 1 << 10;
+DefRec g_defRing[kDefRing];
+std::atomic<uint32_t> g_defHead{0};
+std::atomic<uint64_t> g_defSig{0};
+std::atomic<uint8_t> g_evadeBtn{0};
+uintptr_t g_curVols[8];
+std::atomic<int> g_curN{0};
+
+void PushDef(uint8_t what)
+{
+    DefRec& e = g_defRing[g_defHead.fetch_add(1) & (kDefRing - 1)];
+    e.us = NowUs();
+    e.what = what;
+    e.n = g_curN.load();
+    memcpy(e.vols, g_curVols, sizeof(e.vols));
+}
+
+void SampleDefense()
+{
+    const uintptr_t hero = g_hero.load(std::memory_order_relaxed);
+    if (!hero)
+        return;
+    const uintptr_t D = Rd<uintptr_t>(hero + 0x3a70);
+    const uintptr_t S = D && Rd<int>(D + 0x48) > 0 ? Rd<uintptr_t>(D + 8) : 0;
+    int n = S ? Rd<int>(S + 0x80) : 0;
+    n = n < 0 ? 0 : (n > 8 ? 8 : n);
+    uintptr_t v[8] = {};
+    if (n)
+        SafeRead(S, v, n * sizeof(uintptr_t));
+    uint64_t sig = 1469598103934665603ull ^ static_cast<uint64_t>(n);
+    for (int i = 0; i < n; ++i)
+        sig = (sig ^ v[i]) * 1099511628211ull;
+    if (g_defSig.exchange(sig) == sig)
+        return;
+    memcpy(g_curVols, v, sizeof(v));
+    g_curN.store(n);
+    PushDef(0);
+}
+
+// ---- 虚拟按键：往奎托斯的手柄状态里写按键位（和真按一样，游戏各处都看得到）----
+// 条件判定上下文 ctx：+0 生物，+0x50 → 输入上下文，其 +0x10 → 手柄对象 pad。
+// pad +0x375 非 0 用 +0x10 那份按键状态，否则 +0xe8（同 0x1400c11e0）；状态 +0 = 当前帧按键位，+0x48 起是历史环。
+// 「按下」= 当前帧有、上一帧历史没有（0x1400f42b0）。每帧游戏读设备会覆盖当前帧，所以按住期间每次判定前都 OR 一次。
+// 按键位（动作 ID 表 0xd85c30）：× 0x40，□ 0x80，△ 0x10，○ 0x20，L1 0x04，R1 0x08。
+constexpr uint32_t kBtnCross = 0x40;
+std::atomic<uint32_t> g_padWrites{0};
+std::atomic<uint32_t> g_padCalls{0}, g_padNotHero{0}, g_padNoPad{0}, g_padAlready{0};
+std::atomic<uintptr_t> g_padLastCreature{0}, g_padLastS{0}, g_padLastPad{0};
+// 左摇杆（输入上下文 +0x410/414/418 = 世界坐标方向 x/y/z，+0x41c = 力度；0x14087b770 拿它和奎托斯朝向做点积/叉积判前后左右）
+std::atomic<uintptr_t> g_heroCtl{0};
+std::atomic<bool> g_evadeStick{true};
+std::atomic<uint32_t> g_stickWrites{0};
+
+void PressPadButtons(uintptr_t ctx) // 只记下奎托斯的输入上下文（摇杆被动记录用）；真正的按键在输入轮询钩子里写
+{
+    if (!ctx || g_heroCtl.load(std::memory_order_relaxed))
+        return;
+    const uintptr_t c = Rd<uintptr_t>(ctx);
+    if (c && c == g_hero.load(std::memory_order_relaxed))
+        g_heroCtl.store(Rd<uintptr_t>(ctx + 0x50), std::memory_order_relaxed);
+}
+
+// ---- 每帧输入轮询 0x14086b2c0 ----
+// 奎托斯的手柄 = 全局 0x142506320（游戏读键盘/手柄后在这里更新）。0x140438770(手柄, 原始键号, 按压量 0..255) 是游戏自己的
+// 单键置位：写 +0x68[键]、+0x10 原始掩码、按重映射表 +0x318 写 +0x140[键] 和 +0xe8 掩码。× = 键号 6（掩码 0x40）。
+// 左摇杆：+0x1c8 原始 (x,y)（相对镜头，W = (0,1)），+0x1d0/+0x1d8/+0x1f0 平滑副本，+0x1e0 角度(度, atan2(x,y))，
+// +0x1e4 力度，+0x1e8 单位方向。轮询跑完立即覆盖，后面的平滑/世界方向换算/动作判定看到的就是我们给的值。
+constexpr uintptr_t kPadRva = 0x2506320;
+constexpr uintptr_t kSetButtonRva = 0x438770;
+constexpr uintptr_t kCamMgrRva = 0x22a93d0; // 相机：+0xaa0 世界矩阵，行0 右、行2 后
+constexpr uint32_t kCrossKey = 6;
+using SetButtonFn = void(__fastcall*)(uintptr_t pad, uint32_t key, uint8_t value);
+std::atomic<bool> g_crossDown{false};
+std::atomic<uint32_t> g_pollCalls{0};
+
+bool WorldToStick(float wx, float wz, float& sx, float& sy)
+{
+    const uintptr_t cam = Rd<uintptr_t>(g_exe + kCamMgrRva);
+    float M[12] = {};
+    if (!cam || !SafeRead(cam + 0xaa0, M, sizeof M))
+        return false;
+    float rx = M[0], rz = M[2], fx = -M[8], fz = -M[10];
+    const float rl = sqrtf(rx * rx + rz * rz), fl = sqrtf(fx * fx + fz * fz);
+    if (rl < 1e-4f || fl < 1e-4f)
+        return false;
+    sx = (wx * rx + wz * rz) / rl;
+    sy = (wx * fx + wz * fz) / fl;
+    const float l = sqrtf(sx * sx + sy * sy);
+    if (l < 1e-4f)
+        return false;
+    sx /= l;
+    sy /= l;
+    return true;
+}
+
+std::atomic<uint32_t> g_condWrites{0};
+void WriteStick(uintptr_t pad)
+{
+    float sx, sy;
+    if (!g_evadeStick.load(std::memory_order_relaxed) ||
+        !WorldToStick(g_evadeDirX.load(std::memory_order_relaxed), g_evadeDirZ.load(std::memory_order_relaxed), sx, sy))
+        return;
+    float* f = reinterpret_cast<float*>(pad + 0x1c8);
+    f[0] = sx, f[1] = sy;               // 1c8 原始
+    f[2] = sx, f[3] = sy;               // 1d0
+    f[4] = sx, f[5] = sy;               // 1d8
+    f[6] = atan2f(sx, sy) * 57.29578f;  // 1e0 角度
+    f[7] = 1.f;                         // 1e4 力度
+    f[8] = sx, f[9] = sy;               // 1e8 单位方向
+    f[10] = sx, f[11] = sy;             // 1f0
+    g_stickWrites.fetch_add(1, std::memory_order_relaxed);
+}
+
+// 按键判定那一刻（游戏真正读按键的时候）再写一遍：v5.6 实测轮询后写的会在读之前被重算覆盖
+void ApplyVirtualPadAtCond(uintptr_t ctx)
+{
+    const int64_t es = g_evadeStart.load(std::memory_order_relaxed);
+    if (!es || NowUs() - es >= g_evadeTapUs.load(std::memory_order_relaxed) || !ctx)
+        return;
+    if (Rd<uintptr_t>(ctx) != g_hero.load(std::memory_order_relaxed))
+        return;
+    const uintptr_t pad = g_exe + kPadRva;
+    *reinterpret_cast<volatile uint32_t*>(pad + 0xe8) |= 0x40;
+    *reinterpret_cast<volatile uint32_t*>(pad + 0x10) |= 0x40;
+    reinterpret_cast<volatile uint32_t*>(pad + 0x68)[kCrossKey] = 255;
+    reinterpret_cast<volatile uint32_t*>(pad + 0x140)[kCrossKey] = 255;
+    WriteStick(pad);
+    if (const uintptr_t ctl = Rd<uintptr_t>(ctx + 0x50)) { // 世界方向的摇杆（0x14087b770 读的那份）
+        float* v = reinterpret_cast<float*>(ctl + 0x410);
+        v[0] = g_evadeDirX.load(std::memory_order_relaxed);
+        v[1] = 0.f;
+        v[2] = g_evadeDirZ.load(std::memory_order_relaxed);
+        v[3] = 1.f;
+    }
+    g_condWrites.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ApplyVirtualPad()
+{
+    const uintptr_t pad = g_exe + kPadRva;
+    const auto setButton = reinterpret_cast<SetButtonFn>(g_exe + kSetButtonRva);
+    const int64_t es = g_evadeStart.load(std::memory_order_relaxed);
+    const bool active = es && NowUs() - es < g_evadeTapUs.load(std::memory_order_relaxed);
+    if (!active) {
+        if (g_crossDown.exchange(false, std::memory_order_relaxed))
+            setButton(pad, kCrossKey, 0); // 松开
+        return;
+    }
+    g_pollCalls.fetch_add(1, std::memory_order_relaxed);
+    g_padLastPad.store(pad, std::memory_order_relaxed);
+    g_padLastS.store(pad + 0xe8, std::memory_order_relaxed);
+    setButton(pad, kCrossKey, 255);
+    g_crossDown.store(true, std::memory_order_relaxed);
+    g_padWrites.fetch_add(1, std::memory_order_relaxed);
+    WriteStick(pad);
+}
+
+// 被动记录：每帧轮询后手柄状态有变化就记一条（真按闪避时的样子，用来对照虚拟按键）
+struct PadRec {
+    int64_t us;
+    uint32_t e8, raw10, nz140; // nz140：+0x140 起 32 个按压量里非 0 的位
+    float sx, sy, mag;
+    uint32_t v140[8];
+};
+constexpr uint32_t kPadRing = 256;
+PadRec g_padRing[kPadRing];
+std::atomic<uint32_t> g_padHead{0};
+uint32_t g_lastE8 = 0xFFFFFFFF;
+
+void SamplePad()
+{
+    const uintptr_t pad = g_exe + kPadRva;
+    const uint32_t e8 = *reinterpret_cast<uint32_t*>(pad + 0xe8);
+    if (e8 == g_lastE8)
+        return;
+    g_lastE8 = e8;
+    PadRec& r = g_padRing[g_padHead.fetch_add(1) & (kPadRing - 1)];
+    r.us = NowUs();
+    r.e8 = e8;
+    r.raw10 = *reinterpret_cast<uint32_t*>(pad + 0x10);
+    const uint32_t* v = reinterpret_cast<uint32_t*>(pad + 0x140);
+    r.nz140 = 0;
+    for (int i = 0; i < 32; ++i)
+        if (v[i])
+            r.nz140 |= 1u << i;
+    for (int i = 0; i < 8; ++i)
+        r.v140[i] = v[i];
+    const float* f = reinterpret_cast<float*>(pad + 0x1c8);
+    r.sx = f[0];
+    r.sy = f[1];
+    r.mag = f[7];
+}
+
+using PollFn = void(__fastcall*)(uint64_t);
+extern Hook g_poll;
+void __fastcall PollDetour(uint64_t a)
+{
+    g_inflight.fetch_add(1, std::memory_order_acquire);
+    reinterpret_cast<PollFn>(g_poll.tramp)(a);
+    __try {
+        SamplePad();
+        ApplyVirtualPad();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    g_inflight.fetch_sub(1, std::memory_order_release);
+}
+const uint8_t kPollBytes[] = {0x48, 0x89, 0x4c, 0x24, 0x08, 0x48, 0x83, 0xec, 0x38};
+Hook g_poll{"输入轮询", 0x86b2c0, kPollBytes, sizeof(kPollBytes), 5, reinterpret_cast<void*>(&PollDetour)};
+
+// ---- 2. 按键条件判定 0x87ac70：按住期间 L1（动作ID 0x05）类型 1/7 一律成立 ----
+using CondFn = uint64_t(__fastcall*)(void* ctx, uint8_t* prompt, void* out);
+// mov r11,rsp / push rsi / push r12 / push r13 / sub rsp,0x60
+constexpr uint8_t kCondBytes[12] = {0x4C, 0x8B, 0xDC, 0x56, 0x41, 0x54, 0x41, 0x55, 0x48, 0x83, 0xEC, 0x60};
+uint64_t __fastcall CondDetour(void*, uint8_t*, void*);
+Hook g_cond{"按键条件", 0x87ac70, kCondBytes, sizeof(kCondBytes), 6, reinterpret_cast<void*>(&CondDetour)};
+
+uint64_t __fastcall CondDetour(void* ctx, uint8_t* prompt, void* out)
+{
+    g_inflight.fetch_add(1, std::memory_order_acquire);
+    if (!g_hero.load(std::memory_order_relaxed) && ctx)
+        IsHero(Rd<uintptr_t>(reinterpret_cast<uintptr_t>(ctx)));
+    PressPadButtons(reinterpret_cast<uintptr_t>(ctx));
+    __try {
+        ApplyVirtualPadAtCond(reinterpret_cast<uintptr_t>(ctx));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    uint64_t r = reinterpret_cast<CondFn>(g_cond.tramp)(ctx, prompt, out);
+    SampleDefense();
+    if (prompt && *reinterpret_cast<uint16_t*>(prompt + 0xe8) == 0x01 && prompt[0xef] == 1) { // × 按下
+        const uint8_t now = static_cast<uint8_t>(r & 0xFF) != 0;
+        if (g_evadeBtn.exchange(now) != now)
+            PushDef(now ? 1 : 2);
+    }
+    const int64_t ps = g_pressStart.load(std::memory_order_relaxed);
+    if (ps && prompt && NowUs() - ps < kHoldUs) {
+        const uint16_t id = *reinterpret_cast<uint16_t*>(prompt + 0xe8);
+        const uint8_t type = prompt[0xef];
+        if (id == 0x05 && (type == 1 || type == 7)) {
+            g_condSeen.fetch_add(1, std::memory_order_relaxed);
+            const bool release = g_releaseFirst.load(std::memory_order_relaxed) && NowUs() - ps < kReleaseUs;
+            const uint64_t want = release ? 0 : 1;
+            if ((r & 0xFF) != want) {
+                r = (r & ~0xFFull) | want;
+                g_forced.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    } else if (prompt && *reinterpret_cast<uint16_t*>(prompt + 0xe8) == 0x05 && prompt[0xef] == 7) {
+        g_l1Natural.store((r & 0xFF) != 0, std::memory_order_relaxed);
+    }
+    g_inflight.fetch_sub(1, std::memory_order_release);
+    return r;
+}
+
+// ---- 3. 格挡判定 0x79f0c0：只记录奎托斯挨打的结果 ----
+using BlockFn = uint64_t(__fastcall*)(uintptr_t, uintptr_t, uintptr_t, uint64_t, uint64_t, uint64_t, uint8_t*);
+constexpr uint8_t kBlockBytes[8] = {0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x10, 0x49};
+uint64_t __fastcall BlockDetour(uintptr_t, uintptr_t, uintptr_t, uint64_t, uint64_t, uint64_t, uint8_t*);
+Hook g_block{"格挡判定", 0x79f0c0, kBlockBytes, sizeof(kBlockBytes), 7, reinterpret_cast<void*>(&BlockDetour)};
+
+uint64_t __fastcall BlockDetour(uintptr_t dc, uintptr_t attacker, uintptr_t victim, uint64_t f, uint64_t p5, uint64_t p6,
+    uint8_t* out)
+{
+    g_inflight.fetch_add(1, std::memory_order_acquire);
+    // 背后来的攻击：弹反体 +0x08 挂着附加条件表（0x7c33a0 判，背后的会不过）。
+    // 奎托斯在弹反窗口里时，这次判定先把弹反体的条件指针清零，判完原样还原 → 背后也能弹反。
+    uintptr_t vols[kSetSlots], conds[kSetSlots];
+    int nv = 0;
+    IsHero(attacker); // 奎托斯砍敌人时也认出他，好提前开始记防御组
+    const bool hero = IsHero(victim);
+    if (hero && g_anyAngle.load(std::memory_order_relaxed)) {
+        const uintptr_t D = Rd<uintptr_t>(victim + 0x3a70);
+        const int nSets = D ? Rd<int>(D + 0x48) : 0;
+        for (int s = 0; s < nSets && s < 4; ++s) {
+            const uintptr_t S = Rd<uintptr_t>(D + 8 + s * 8);
+            const int n = S ? Rd<int>(S + 0x80) : 0;
+            for (int i = 0; i < n && i < kSetSlots && nv < kSetSlots; ++i) {
+                const uintptr_t v = Rd<uintptr_t>(S + i * 8);
+                const uintptr_t c = v ? Rd<uintptr_t>(v + 8) : 0;
+                if (!c || !(Rd<float>(v + 0x40) > 0.f))
+                    continue;
+                __try {
+                    *reinterpret_cast<uintptr_t*>(v + 8) = 0;
+                    vols[nv] = v;
+                    conds[nv++] = c;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                }
+            }
+        }
+    }
+    // p6 = 命中记录 +0xd0：0x1401dcac0 按攻击者位置查出的「打在受击者哪个区域」。弹反体 +0x20 只认 011CBBEB9CE82EB8，
+    // 但不同敌人/招式会算出别的区域（实测正面 000042500EBF0338）→ 弹反窗口里也对不上。游戏规则里 p6 = 0 表示不限区域，
+    // 所以奎托斯在弹反窗口里时，这次判定传 p6 = 0。
+    uint64_t p6Use = p6;
+    if (hero && g_anyZone.load(std::memory_order_relaxed) && p6 && InParryWindow(victim))
+        p6Use = 0;
+    const uint64_t r = reinterpret_cast<BlockFn>(g_block.tramp)(dc, attacker, victim, f, p5, p6Use, out);
+    for (int i = 0; i < nv; ++i)
+        __try {
+            *reinterpret_cast<uintptr_t*>(vols[i] + 8) = conds[i];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    if (IsHero(attacker) && victim && victim == g_passAttacker.load() && NowUs() - g_passUs.load() < 600'000) {
+        g_passAttacker.store(0);
+        g_parryOk.fetch_add(1);
+        Push(kShove, attacker, victim, static_cast<uint8_t>(r), 0, 0, f, p5, p6);
+    }
+    if (hero)
+        Push(kBlock, attacker, victim, static_cast<uint8_t>(r), out ? *out : 0xFF, static_cast<uint8_t>(nv), f, p5, p6);
+    g_inflight.fetch_sub(1, std::memory_order_release);
+    return r;
+}
+
+const char* Name(uintptr_t creature, char (&buf)[32])
+{
+    buf[0] = 0;
+    const uintptr_t go = Rd<uintptr_t>(creature + 8);
+    const uintptr_t str = go ? Rd<uintptr_t>(go + 0x38) : 0;
+    if (!str || !SafeRead(str, buf, 31))
+        strcpy_s(buf, "?");
+    buf[31] = 0;
+    return buf;
+}
+
+DWORD WINAPI Worker(void*)
+{
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"gow4_autoparry.log");
+    g_log = _wfsopen(path, L"ab", _SH_DENYNO);
+    Log("==== 自动弹反实验 v5.8（闪避按同一刀整段吞，最长 2 s）加载 ====");
+    HANDLE unload = CreateEventW(nullptr, TRUE, FALSE, L"Local\\gow4_autoparry_unload");
+    g_exe = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(g_exe + reinterpret_cast<IMAGE_DOS_HEADER*>(g_exe)->e_lfanew);
+    bool ok = nt->OptionalHeader.SizeOfImage > 0x2000000;
+    if (!ok)
+        Log("宿主进程不是 GoW.exe，不装");
+    // 先装只记录的，再装按键，最后装会改行为的碰撞入口；任何一个失败就全部不启用
+    ok = ok && Install(g_block) && Install(g_cond) && Install(g_contact) && Install(g_poll);
+
+    static const char* const kKindText[] = {"吞掉并按下 L1", "继续吞", "放行（已在弹反窗口）", "放行（吞超时）",
+        "放行（冷却中）", "格挡判定", "自动弹反关着，照常结算", "背后来的：吞掉并按 ×", "背后来的：继续吞（闪避中）", "背后来的：放行（吞超时）", "弹反成功", "不在可弹反区域（背后半圈），暂不处理", "你自己按着 L1，照常格挡"};
+    wchar_t ini[MAX_PATH];
+    GetModuleFileNameW(g_self, ini, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(ini, L'\\'))
+        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - ini), L"gow4_autoparry.ini");
+    std::unordered_set<uintptr_t> seenVols;
+    uint32_t tail = 0, defTail = 0;
+    uint32_t lastForced = 0;
+    uint64_t lastIni = 0;
+    float lastMag = 0.f, lastDx = 0.f, lastDz = 0.f;
+    int64_t seenEvade = 0, evadeCheckAt = 0;
+    float evadeP0[3] = {};
+    while (ok && WaitForSingleObject(unload, 50) != WAIT_OBJECT_0) {
+        if (const int64_t es = g_evadeStart.load(); es && es != seenEvade) { // 每次闪避：记起点，0.4 s 后看移动了多少
+            seenEvade = es;
+            evadeCheckAt = es + 400'000;
+            if (const uintptr_t h = g_hero.load())
+                WorldPos(Rd<uintptr_t>(h + 8), evadeP0);
+            Log("  ↷ 闪避：按 ×（%u 次）推摇杆 (%.2f, %.2f)", g_padWrites.load(), g_evadeDirX.load(), g_evadeDirZ.load());
+        }
+        if (evadeCheckAt && NowUs() >= evadeCheckAt) {
+            evadeCheckAt = 0;
+            float p[3] = {};
+            if (const uintptr_t h = g_hero.load(); h && WorldPos(Rd<uintptr_t>(h + 8), p)) {
+                const float dx = p[0] - evadeP0[0], dz = p[2] - evadeP0[2];
+                const float along = dx * g_evadeDirX.load() + dz * g_evadeDirZ.load();
+                Log("  ↷ 闪避结果：0.4 s 内移动 %.2f m，其中朝闪避方向 %.2f m（输入轮询写入 %u 次，按键判定时写入 %u 次）",
+                    sqrtf(dx * dx + dz * dz), along, g_pollCalls.load(), g_condWrites.load());
+            }
+        }
+        for (static uint32_t padTail = 0; padTail != g_padHead.load(); ++padTail) {
+            const PadRec& r = g_padRing[padTail & (kPadRing - 1)];
+            Log("手柄 e8=%08x 原始10=%08x 有按压量的键=%08x [0..7]=%u %u %u %u %u %u %u %u 摇杆(%.2f,%.2f) 力度%.2f", r.e8, r.raw10,
+                r.nz140, r.v140[0], r.v140[1], r.v140[2], r.v140[3], r.v140[4], r.v140[5], r.v140[6], r.v140[7], r.sx, r.sy,
+                r.mag);
+        }
+        if (const uintptr_t ctl = g_heroCtl.load()) { // 被动记录：摇杆推/放、方向变化，用来对照内存布局
+            float v[4] = {};
+            if (SafeRead(ctl + 0x410, v, sizeof v)) {
+                const bool on = v[3] > 0.3f, wasOn = lastMag > 0.3f;
+                if (on != wasOn || (on && v[0] * lastDx + v[2] * lastDz < 0.94f)) {
+                    float L[12] = {};
+                    if (const uintptr_t h = g_hero.load())
+                        SafeRead(Rd<uintptr_t>(h + 8) + 0x60, L, sizeof(L));
+                    Log("摇杆 方向 (%.2f, %.2f, %.2f) 力度 %.2f ｜ 奎托斯正前方 (%.2f, %.2f)", v[0], v[1], v[2], v[3], -L[8], -L[10]);
+                    lastDx = v[0];
+                    lastDz = v[2];
+                }
+                lastMag = v[3];
+            }
+        }
+        if (GetTickCount64() - lastIni > 1000) {
+            const bool on = GetPrivateProfileIntW(L"autoparry", L"parry", 1, ini) != 0;
+            if (g_parryOn.exchange(on) != on)
+                Log("配置：自动弹反 %s", on ? "开" : "关");
+            if (GetPrivateProfileIntW(L"autoparry", L"test_evade", 0, ini) != 0) {
+                WritePrivateProfileStringW(L"autoparry", L"test_evade", L"0", ini);
+                const uintptr_t h = g_hero.load();
+                float p0[3] = {};
+                if (h && WorldPos(Rd<uintptr_t>(h + 8), p0)) {
+                    const uint32_t w0 = g_padWrites.load();
+                    float L[12] = {};
+                    SafeRead(Rd<uintptr_t>(h + 8) + 0x60, L, sizeof(L));
+                    const float bl = sqrtf(L[8] * L[8] + L[10] * L[10]); // 正前方 = -row2，往后闪 = +row2
+                    g_evadeDirX.store(bl > 0.f ? L[8] / bl : 0.f);
+                    g_evadeDirZ.store(bl > 0.f ? L[10] / bl : 0.f);
+                    g_evadeStick.store(GetPrivateProfileIntW(L"autoparry", L"test_stick", 1, ini) != 0);
+                    Log("自测：摇杆%s，方向 (%.2f, %.2f)（往奎托斯身后）", g_evadeStick.load() ? "一起推" : "不推",
+                        g_evadeDirX.load(), g_evadeDirZ.load());
+                    g_evadeStart.store(NowUs());
+                    Log("自测：替你按一下 ×（%lld ms），奎托斯在 (%.2f, %.2f, %.2f)", g_evadeTapUs.load() / 1000, p0[0], p0[1], p0[2]);
+                    auto dumpPad = [](const char* tag) {
+                        const uintptr_t pad = g_padLastPad.load();
+                        if (!pad)
+                            return;
+                        for (const uintptr_t off : {uintptr_t{0x10}, uintptr_t{0xe8}}) {
+                            const uintptr_t S = pad + off;
+                            const uintptr_t ring = Rd<uintptr_t>(S + 0x48);
+                            const uint16_t size = Rd<uint16_t>(S + 0x50), head = Rd<uint16_t>(S + 0x52), tail = Rd<uint16_t>(S + 0x54);
+                            char line[256];
+                            int n = snprintf(line, sizeof line, "%s 状态+%02llx 当前=%04x 环 大小%u 头%u 尾%u 新→旧:", tag,
+                                static_cast<unsigned long long>(off), Rd<uint32_t>(S), size, head, tail);
+                            for (int i = 0; i < 8 && size && (size & (size - 1)) == 0; ++i)
+                                n += snprintf(line + n, sizeof line - n, " %04x",
+                                    Rd<uint32_t>(ring + ((tail - 1 - i) & (size - 1)) * 4));
+                            Log("%s", line);
+                        }
+                        Log("%s 选用 %s，允许掩码 %08x", tag, Rd<uint8_t>(pad + 0x375) ? "+10" : "+e8",
+                            Rd<uint32_t>(pad + 0x2a8 + Rd<int32_t>(pad + 0x2a4) * 4) & ~Rd<uint32_t>(pad + 0x2c4));
+                    };
+                    Sleep(30);
+                    dumpPad("  按住中");
+                    Sleep(90);
+                    dumpPad("  刚松开");
+                    for (int k = 2; k <= 6; ++k) {
+                        Sleep(100);
+                        float p[3] = {};
+                        WorldPos(Rd<uintptr_t>(h + 8), p);
+                        const float dx = p[0] - p0[0], dz = p[2] - p0[2];
+                        Log("  +%d ms：移动 %.2f m（写入 × 位 %u 次，摇杆 %u 次）", k * 100, sqrtf(dx * dx + dz * dz),
+                            g_padWrites.load() - w0, g_stickWrites.load());
+                    }
+                    Log("  输入轮询在窗口内跑了 %u 次", g_pollCalls.load());
+                    Log("  诊断：判定调用 %u，不是奎托斯 %u（最后一个生物 %p，奎托斯 %p），无手柄 %u，已按着 %u，按键状态地址 %p",
+                        g_padCalls.load(), g_padNotHero.load(), reinterpret_cast<void*>(g_padLastCreature.load()),
+                        reinterpret_cast<void*>(g_hero.load()), g_padNoPad.load(), g_padAlready.load(),
+                        reinterpret_cast<void*>(g_padLastS.load()));
+                } else {
+                    Log("自测：还没认出奎托斯（进战斗或砍一下东西再试）");
+                }
+            }
+            const bool z = GetPrivateProfileIntW(L"autoparry", L"zone", 0, ini) != 0;
+            if (g_anyZone.exchange(z) != z)
+                Log("配置：弹反不限命中区域 %s", z ? "开" : "关");
+            const bool ev = GetPrivateProfileIntW(L"autoparry", L"evade", 1, ini) != 0;
+            if (g_evadeOn.exchange(ev) != ev)
+                Log("配置：背后自动闪避 %s", ev ? "开" : "关");
+            g_evadeTapUs.store(static_cast<int64_t>(GetPrivateProfileIntW(L"autoparry", L"evade_ms", 200, ini)) * 1000);
+            const int bd = static_cast<int>(GetPrivateProfileIntW(L"autoparry", L"back_deg", 100, ini));
+            if (g_backDeg.exchange(bd) != bd)
+                Log("配置：背后 = 方位超过 %d°", bd);
+            lastIni = GetTickCount64();
+        }
+        const uint32_t head = g_head.load();
+        for (; tail != head; ++tail) {
+            const Rec& e = g_ring[tail & (kRing - 1)];
+            char an[32];
+            const double ms = e.sincePress < 0 ? -1.0 : e.sincePress / 1000.0;
+            if (e.kind == kBlock) {
+                const uintptr_t vol = Rd<uintptr_t>(e.victim + 0x4670);
+                Log("  格挡判定 返回=%u 输出=%u 匹配防御体=%p(半径 %.1f) 命中标志=%016llX p5=%016llX p6=%016llX 方位 %.0f° %.1fm%s",
+                    e.ret, e.out, reinterpret_cast<void*>(vol), vol ? Rd<float>(vol + 0x40) : -1.f,
+                    static_cast<unsigned long long>(e.flags), static_cast<unsigned long long>(e.p5),
+                    static_cast<unsigned long long>(e.p6), e.deg, e.dist,
+                    e.ret && e.out ? " ← 弹反" : (e.ret ? " ← 格挡/防住" : " ← 挨打"));
+                Log("    %s 出招状态=%#x（0x10/0x20/0x400 才会被弹开） 默认被挡反应=%u 防御体反应=%u", Name(e.attacker, an),
+                    e.aiState, e.react, e.matchReact);
+            } else if (e.kind == kShove) {
+                Log("  ★ 弹反成功：奎托斯震到 %s（命中标志=%016llX，按下后 %.0f ms）  累计 成功 %u / 尝试 %u",
+                    Name(e.victim, an), static_cast<unsigned long long>(e.flags), ms, g_parryOk.load(), g_parryTry.load());
+            } else {
+                Log("%s 碰到奎托斯：%s（方位 %.0f° 距离 %.1fm，按下后 %.0f ms）", Name(e.attacker, an), kKindText[e.kind],
+                    e.deg, e.dist, ms);
+            }
+        }
+        const uint32_t dh = g_defHead.load();
+        if (dh - defTail > kDefRing)
+            defTail = dh - kDefRing;
+        for (; defTail != dh; ++defTail) {
+            const DefRec& e = g_defRing[defTail & (kDefRing - 1)];
+            if (e.what) {
+                Log("× %s", e.what == 1 ? "按下" : "松开");
+                continue;
+            }
+            char line[512];
+            int len = sprintf_s(line, "防御组 %d 个:", e.n);
+            for (int i = 0; i < e.n && len > 0 && len < 450; ++i)
+                len += sprintf_s(line + len, sizeof(line) - len, " %p(r%.0f)", reinterpret_cast<void*>(e.vols[i]),
+                    Rd<float>(e.vols[i] + 0x40));
+            Log("%s", line);
+            for (int i = 0; i < e.n; ++i) {
+                const uintptr_t v = e.vols[i];
+                if (!v || !seenVols.insert(v).second)
+                    continue;
+                Log("    新防御体 %p：掩码10=%llX 掩码18=%X 哈希20=%llX 条件08=%p 半径40=%.1f", reinterpret_cast<void*>(v),
+                    static_cast<unsigned long long>(Rd<uint64_t>(v + 0x10)), Rd<uint32_t>(v + 0x18),
+                    static_cast<unsigned long long>(Rd<uint64_t>(v + 0x20)), reinterpret_cast<void*>(Rd<uintptr_t>(v + 8)),
+                    Rd<float>(v + 0x40));
+            }
+        }
+        const uint32_t f = g_forced.load();
+        if (f != lastForced) {
+            Log("  L1 条件：被强制成立累计 %u 次（× 累计 %u 次）", f, g_evadeForced.load());
+            lastForced = f;
+        }
+    }
+    if (ok || g_block.installed || g_cond.installed || g_contact.installed) {
+        Remove(g_poll);
+        Remove(g_contact);
+        Remove(g_cond);
+        Remove(g_block);
+        for (int i = 0; i < 200 && g_inflight.load() != 0; ++i)
+            Sleep(10);
+        Sleep(200);
+    }
+    Log("==== 自动弹反实验卸载 ====");
+    if (g_log)
+        fclose(g_log);
+    CloseHandle(unload);
+    FreeLibraryAndExitThread(g_self, 0);
+}
+
+} // namespace
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_self = module;
+        DisableThreadLibraryCalls(module);
+        if (HANDLE t = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr))
+            CloseHandle(t);
+    }
+    return TRUE;
+}
