@@ -1,0 +1,60 @@
+name: build
+
+# 每次推到 main、每个 PR 都编一遍：全部目标 + 配置读写测试 + 单文件成品。
+# 成品 gow4_trainer.exe 作为构建产物挂在这次运行的页面上（Actions → 这次运行 → Artifacts）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # 固定在带 VS 2022 的镜像上：build.ps1 用的生成器是 "Visual Studio 17 2022"
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 开发版（全部目标）
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: 测试（配置读写）
+        shell: pwsh
+        run: .\build\Release\trainer_tests.exe
+
+      - name: 单文件成品
+        shell: pwsh
+        run: .\build.ps1 -Dist
+
+      - name: 成品自检（内嵌的 DLL 能原样释放出来）
+        shell: pwsh
+        run: |
+          # --check：读配置、找游戏（这里没有）、释放内嵌的 DLL、试着建覆盖层；不注入、不写 ini、不显示窗口
+          $report = Join-Path $env:RUNNER_TEMP 'check.txt'
+          $p = Start-Process .\dist\gow4_trainer.exe -ArgumentList '--check', $report -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw '自检 60 秒没结束' }
+          if (Test-Path $report) { Get-Content $report -Encoding UTF8 }
+          # 构建机没有显卡，覆盖层建不出来不算失败；要求的是两个 DLL 释放出来、和刚编出来的逐字节一致
+          foreach ($stem in 'gow4_autoparry', 'gow4_esp') {
+              $out = @(Get-ChildItem (Join-Path $env:LOCALAPPDATA 'gow4_trainer') -Filter "${stem}_*.dll" -ErrorAction SilentlyContinue)
+              if ($out.Count -ne 1) { throw "没释放出 $stem（找到 $($out.Count) 个）" }
+              $want = (Get-FileHash ".\build-dist\Release\$stem.dll").Hash
+              if ((Get-FileHash $out[0].FullName).Hash -ne $want) { throw "$stem 释放出来的和编出来的不一致" }
+              '{0}  {1} 字节  一致' -f $out[0].Name, $out[0].Length
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gow4_trainer
+          path: dist/gow4_trainer.exe
+          if-no-files-found: error
